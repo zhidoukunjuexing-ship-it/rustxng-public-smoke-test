@@ -1,0 +1,85 @@
+name: Public RustXNG smoke test
+on:
+  push:
+    paths: ['.github/workflows/smoke.yml']
+permissions: {}
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download fixed upstream binary and verify published hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rustxng-input"
+          cd "$RUNNER_TEMP/rustxng-input"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 90 \
+            -o rustxng https://github.com/sahenjp/RustXNG/releases/download/v0.26.0/rustxng-v0.26.0-x86_64-unknown-linux-musl
+          echo '250c75f2bb623c99065087b06d40550cd802b48c7ada265e2d7448bbf1d7f839  rustxng' | sha256sum --check
+          chmod 0555 rustxng
+          cat > settings.toml <<'CONFIG'
+          [server]
+          bind_address = "127.0.0.1"
+          port = 8888
+          idle_timeout = 120
+          [general]
+          debug = false
+          CONFIG
+          cat > smoke.py <<'PY'
+          import json, os, subprocess, time, urllib.request, urllib.parse
+          assert os.getuid() != 0, 'Must be non-root'
+          assert not any(k in os.environ for k in ('GITHUB_TOKEN', 'GH_TOKEN', 'ACTIONS_RUNTIME_TOKEN'))
+          print(json.dumps({'uid': os.getuid(), 'version_target': 'v0.26.0', 'private_inputs': False}), flush=True)
+          server = subprocess.Popen(['/input/rustxng', '--config', '/input/settings.toml'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+          base = 'http://127.0.0.1:8888'
+          try:
+              ready = False
+              for _ in range(60):
+                  if server.poll() is not None:
+                      raise RuntimeError('Server exited with code ' + str(server.returncode))
+                  try:
+                      with urllib.request.urlopen(base + '/healthz', timeout=1) as r:
+                          ready = r.status == 200
+                      if ready: break
+                  except Exception:
+                      time.sleep(0.5)
+              if not ready: raise RuntimeError('Health check did not become ready')
+              cases = [('python dict get documentation', 'docs.python.org'), ('Rust ownership documentation', 'doc.rust-lang.org'), ('東京 観光 公式', 'gotokyo.org'), ('python dict get documentation', 'docs.python.org')]
+              for index, (query, expected) in enumerate(cases):
+                  params = urllib.parse.urlencode({'q': query, 'format': 'json', 'include_raw_content': '1', 'max_results': '5'})
+                  start = time.monotonic()
+                  try:
+                      with urllib.request.urlopen(base + '/search?' + params, timeout=45) as response:
+                          data = json.loads(response.read(8_000_000))
+                      results = data.get('results', [])[:5]
+                      urls = [r.get('url', '') for r in results]
+                      hit = any(urllib.parse.urlparse(u).hostname == expected or (urllib.parse.urlparse(u).hostname or '').endswith('.' + expected) for u in urls)
+                      print(json.dumps({'query': query, 'repeat': index == 3, 'seconds': round(time.monotonic() - start, 3), 'results': len(results), 'urls': urls, 'expected_domain_top5': hit, 'raw_content_characters': sum(len(r.get('raw_content') or '') for r in results), 'unresponsive_engines': data.get('unresponsive_engines', [])}, ensure_ascii=True), flush=True)
+                  except Exception as error:
+                      print(json.dumps({'query': query, 'error': type(error).__name__, 'seconds': round(time.monotonic() - start, 3)}), flush=True)
+                  time.sleep(3)
+          finally:
+              server.terminate()
+              try: server.wait(timeout=5)
+              except subprocess.TimeoutExpired:
+                  server.kill()
+                  server.wait()
+          PY
+          chmod 0444 settings.toml smoke.py
+      - name: Run without credentials or host data in a constrained container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull python:3.12-slim-bookworm
+          IMAGE=$(docker image inspect python:3.12-slim-bookworm --format '{{index .RepoDigests 0}}')
+          echo "Container image: $IMAGE"
+          trap 'docker rm -f rustxng-public-smoke >/dev/null 2>&1 || true' EXIT
+          timeout 300 docker run --name rustxng-public-smoke --rm \
+            --user 65534:65534 --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true --pids-limit 128 \
+            --memory 512m --cpus 1 --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --mount type=bind,src="$RUNNER_TEMP/rustxng-input",dst=/input,readonly \
+            --workdir /tmp "$IMAGE" \
+            env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/tmp \
+            PYTHONDONTWRITEBYTECODE=1 python /input/smoke.py
